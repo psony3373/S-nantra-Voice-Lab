@@ -1,0 +1,6 @@
+{
+  "name": "Eryx & Elyra Voice Studio",
+  "description": "Studio lokal TTS & STT khusus karakter suara Eryx & Elyra dengan DSP whispering ASMR, pembaca lirik lagu/puisi, dan pipeline RVC/Piper TTS tanpa kredit ElevenLabs.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
