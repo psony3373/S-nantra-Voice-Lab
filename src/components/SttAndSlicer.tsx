@@ -11,7 +11,11 @@ import {
   FileSpreadsheet,
   CheckCircle2,
   Trash2,
-  AlertCircle
+  AlertCircle,
+  AlertTriangle,
+  Volume2,
+  RefreshCw,
+  Plus
 } from 'lucide-react';
 import { VoiceId, DatasetSlice } from '../types';
 
@@ -25,6 +29,7 @@ export const SttAndSlicer: React.FC<SttAndSlicerProps> = ({ activeVoice }) => {
   const [sttLanguage, setSttLanguage] = useState<'id-ID' | 'en-US'>('id-ID');
   const [liveTranscript, setLiveTranscript] = useState<string>('');
   const [transcriptHistory, setTranscriptHistory] = useState<string[]>([]);
+  const [sttNotice, setSttNotice] = useState<string | null>(null);
   const recognitionRef = useRef<any>(null);
 
   // Audio recording / dataset slicing state
@@ -32,6 +37,7 @@ export const SttAndSlicer: React.FC<SttAndSlicerProps> = ({ activeVoice }) => {
   const [recordingDuration, setRecordingDuration] = useState<number>(0);
   const [recordedAudioBlob, setRecordedAudioBlob] = useState<Blob | null>(null);
   const [recordedAudioUrl, setRecordedAudioUrl] = useState<string | null>(null);
+  const [micNotice, setMicNotice] = useState<string | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const timerRef = useRef<any>(null);
@@ -92,7 +98,16 @@ export const SttAndSlicer: React.FC<SttAndSlicerProps> = ({ activeVoice }) => {
       };
 
       recognition.onerror = (e: any) => {
-        console.error('Speech recognition error', e);
+        const errCode = e?.error;
+        if (errCode === 'no-speech') {
+          // Normal timeout when no speech is detected in silence
+          return;
+        }
+        if (errCode === 'audio-capture' || errCode === 'not-allowed') {
+          setSttNotice('Mikrofon fisik tidak terdeteksi atau izin belum diberikan. Kamu dapat menggunakan tombol "Sisipkan Contoh Transkrip" untuk mencoba.');
+        } else {
+          setSttNotice(`Status Web Speech: ${errCode || 'menunggu input suara'}.`);
+        }
         setIsListening(false);
       };
 
@@ -107,69 +122,183 @@ export const SttAndSlicer: React.FC<SttAndSlicerProps> = ({ activeVoice }) => {
   // Toggle STT listening
   const handleToggleListening = () => {
     if (!recognitionRef.current) {
-      alert('Browser ini belum mendukung Web Speech Recognition. Gunakan Chrome atau Edge.');
+      setSttNotice('Browser ini atau lingkungan iframe membatasi Web Speech Recognition. Silakan gunakan tombol "+ Sisipkan Contoh Transkrip" di bawah.');
       return;
     }
 
     if (isListening) {
-      recognitionRef.current.stop();
+      try {
+        recognitionRef.current.stop();
+      } catch {}
       setIsListening(false);
     } else {
       setLiveTranscript('');
+      setSttNotice(null);
       try {
         recognitionRef.current.lang = sttLanguage;
         recognitionRef.current.start();
         setIsListening(true);
-      } catch (err) {
-        console.error('Could not start recognition', err);
+      } catch (err: any) {
+        setSttNotice('Tidak dapat mengaktifkan speech recognition pada perangkat ini.');
+        setIsListening(false);
       }
     }
   };
 
-  // Toggle audio recording from mic
+  // Generate sample offline whispering audio for testing Slicer without physical mic
+  const handleLoadSampleAudio = () => {
+    setMicNotice(null);
+    const sampleRate = 22050;
+    const duration = 5.5;
+    const totalSamples = Math.floor(sampleRate * duration);
+    const wavBuffer = new ArrayBuffer(44 + totalSamples * 2);
+    const view = new DataView(wavBuffer);
+
+    // RIFF header
+    const writeString = (offset: number, str: string) => {
+      for (let i = 0; i < str.length; i++) {
+        view.setUint8(offset + i, str.charCodeAt(i));
+      }
+    };
+    writeString(0, 'RIFF');
+    view.setUint32(4, 36 + totalSamples * 2, true);
+    writeString(8, 'WAVE');
+    writeString(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true); // PCM
+    view.setUint16(22, 1, true); // Mono
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeString(36, 'data');
+    view.setUint32(40, totalSamples * 2, true);
+
+    const f0 = activeVoice === 'eryx' ? 105 : 220;
+    for (let i = 0; i < totalSamples; i++) {
+      const t = i / sampleRate;
+      const cadence = Math.sin(2 * Math.PI * 1.5 * t);
+      const envelope = Math.max(0, cadence) * Math.sin((Math.PI * i) / totalSamples);
+      const pitchTone = Math.sin(2 * Math.PI * f0 * t) * 0.25;
+      const breathNoise = (Math.random() * 2 - 1) * 0.45;
+      const sample = (pitchTone * 0.35 + breathNoise * 0.65) * envelope;
+      const intSample = Math.max(-32768, Math.min(32767, sample * 32767));
+      view.setInt16(44 + i * 2, intSample, true);
+    }
+
+    const blob = new Blob([wavBuffer], { type: 'audio/wav' });
+    setRecordedAudioBlob(blob);
+    const url = URL.createObjectURL(blob);
+    setRecordedAudioUrl(url);
+
+    const newSlice: DatasetSlice = {
+      id: `slice-${String(slices.length + 1).padStart(4, '0')}`,
+      startTime: 0,
+      endTime: 5.0,
+      duration: 5.0,
+      transcript: activeVoice === 'eryx'
+        ? 'Dengarkan ketenangan malam ini bersamaku.'
+        : 'Hembuskan perlahan, biarkan rasa lelahmu sirna.',
+      voiceTarget: activeVoice,
+    };
+    setSlices((prev) => [newSlice, ...prev]);
+  };
+
+  // Insert demo transcript line
+  const handleInsertSampleTranscript = () => {
+    const samples = activeVoice === 'eryx'
+      ? [
+          'Suara berat ini mengalun perlahan menemani malammu.',
+          'Tidak perlu tergesa-gesa, nikmati setiap detik kedamaian.',
+          'Dataset vokal lokal ini siap dilatih di RVC v2 tanpa batas.',
+        ]
+      : [
+          'Bisikan lembut menyapa hangat relung hatimu.',
+          'Pejamkan matamu dan ikuti alunan napas ini.',
+          'Karakter vokal Elyra dengan desah napas ASMR yang jernih.',
+        ];
+    const picked = samples[Math.floor(Math.random() * samples.length)];
+    setTranscriptHistory((prev) => [picked, ...prev]);
+    setSttNotice(null);
+  };
+
+  // Toggle audio recording from mic with graceful error handling
   const handleToggleRecordAudio = async () => {
     if (isRecordingAudio) {
       // Stop recording
       if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-        mediaRecorderRef.current.stop();
+        try {
+          mediaRecorderRef.current.stop();
+        } catch {}
       }
       clearInterval(timerRef.current);
       setIsRecordingAudio(false);
-    } else {
-      // Start recording
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        audioChunksRef.current = [];
-        const recorder = new MediaRecorder(stream);
+      return;
+    }
 
-        recorder.ondataavailable = (e) => {
-          if (e.data.size > 0) {
-            audioChunksRef.current.push(e.data);
-          }
-        };
+    setMicNotice(null);
 
-        recorder.onstop = () => {
-          const blob = new Blob(audioChunksRef.current, { type: 'audio/wav' });
-          setRecordedAudioBlob(blob);
-          const url = URL.createObjectURL(blob);
-          setRecordedAudioUrl(url);
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setMicNotice(
+        'Perekaman mikrofon langsung tidak tersedia di lingkungan browser ini. Gunakan tombol "Muat Audio Demo" atau "Upload Audio" di bawah.'
+      );
+      return;
+    }
 
-          // Stop all audio tracks
-          stream.getTracks().forEach((track) => track.stop());
-        };
+    // Start recording
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioChunksRef.current = [];
+      const recorder = new MediaRecorder(stream);
 
-        recorder.start(250);
-        mediaRecorderRef.current = recorder;
-        setIsRecordingAudio(true);
-        setRecordingDuration(0);
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) {
+          audioChunksRef.current.push(e.data);
+        }
+      };
 
-        timerRef.current = setInterval(() => {
-          setRecordingDuration((prev) => prev + 1);
-        }, 1000);
-      } catch (err) {
-        console.error('Error accessing microphone', err);
-        alert('Tidak dapat mengakses mikrofon. Pastikan izin mikrofon telah diberikan.');
+      recorder.onstop = () => {
+        const blob = new Blob(audioChunksRef.current, { type: 'audio/wav' });
+        setRecordedAudioBlob(blob);
+        const url = URL.createObjectURL(blob);
+        setRecordedAudioUrl(url);
+
+        // Stop all audio tracks
+        stream.getTracks().forEach((track) => track.stop());
+      };
+
+      recorder.start(250);
+      mediaRecorderRef.current = recorder;
+      setIsRecordingAudio(true);
+      setRecordingDuration(0);
+
+      timerRef.current = setInterval(() => {
+        setRecordingDuration((prev) => prev + 1);
+      }, 1000);
+    } catch (err: any) {
+      const isNotFound =
+        err?.name === 'NotFoundError' ||
+        err?.name === 'DevicesNotFoundError' ||
+        String(err?.message || '').toLowerCase().includes('not found');
+      const isNotAllowed =
+        err?.name === 'NotAllowedError' ||
+        err?.name === 'PermissionDeniedError' ||
+        String(err?.message || '').toLowerCase().includes('denied');
+
+      if (isNotFound) {
+        setMicNotice(
+          'Mikrofon fisik tidak terdeteksi pada perangkat ini (Requested device not found). Kamu tetap bisa mencoba pemotong audio & dataset dengan menekan tombol "Muat Audio Demo" di bawah.'
+        );
+      } else if (isNotAllowed) {
+        setMicNotice(
+          'Izin akses mikrofon ditolak oleh browser. Buka izin situs atau gunakan tombol "Muat Audio Demo" / Upload file audio.'
+        );
+      } else {
+        setMicNotice(
+          `Tidak dapat mengakses mikrofon (${err?.name || 'Device unavailable'}). Gunakan tombol "Muat Audio Demo" di bawah.`
+        );
       }
+      setIsRecordingAudio(false);
     }
   };
 
@@ -339,6 +468,24 @@ export const SttAndSlicer: React.FC<SttAndSlicerProps> = ({ activeVoice }) => {
               )}
             </button>
 
+            {/* STT Info / Warning Banner */}
+            {sttNotice && (
+              <div className="p-3 rounded-xl bg-amber-950/40 border border-amber-800/60 text-xs text-amber-200 flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                <div className="flex-1 space-y-1.5">
+                  <p>{sttNotice}</p>
+                  <button
+                    type="button"
+                    onClick={handleInsertSampleTranscript}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/30 rounded-lg text-[11px] font-medium transition-colors"
+                  >
+                    <Plus className="w-3 h-3" />
+                    <span>Sisipkan Contoh Transkrip ({activeVoice})</span>
+                  </button>
+                </div>
+              </div>
+            )}
+
             {/* Live interim display */}
             {liveTranscript && (
               <div className="p-3 rounded-xl bg-cyan-950/30 border border-cyan-800/40 text-xs text-cyan-200 animate-pulse">
@@ -348,13 +495,23 @@ export const SttAndSlicer: React.FC<SttAndSlicerProps> = ({ activeVoice }) => {
 
             {/* Transcript history */}
             <div>
-              <span className="text-[11px] text-slate-400 font-medium block mb-2">
-                Riwayat Ucapan Terdeteksi:
-              </span>
+              <div className="flex items-center justify-between gap-2 mb-2">
+                <span className="text-[11px] text-slate-400 font-medium block">
+                  Riwayat Ucapan Terdeteksi:
+                </span>
+                <button
+                  type="button"
+                  onClick={handleInsertSampleTranscript}
+                  className="text-[10px] text-cyan-400 hover:text-cyan-300 flex items-center gap-1 font-medium"
+                >
+                  <Plus className="w-3 h-3" />
+                  <span>Contoh Ucapan</span>
+                </button>
+              </div>
               <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
                 {transcriptHistory.length === 0 ? (
                   <p className="text-xs text-slate-500 italic py-4 text-center">
-                    Belum ada suara terdeteksi. Klik tombol rekam lalu bicaralah.
+                    Belum ada suara terdeteksi. Bicaralah atau klik "Contoh Ucapan".
                   </p>
                 ) : (
                   transcriptHistory.map((item, idx) => (
@@ -392,18 +549,49 @@ export const SttAndSlicer: React.FC<SttAndSlicerProps> = ({ activeVoice }) => {
                 </p>
               </div>
 
-              {/* Upload ElevenLabs file button */}
-              <label className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 text-xs cursor-pointer transition-colors">
-                <Upload className="w-3.5 h-3.5 text-cyan-400" />
-                <span>Upload Audio ElevenLabs</span>
-                <input
-                  type="file"
-                  accept="audio/*"
-                  onChange={handleFileUpload}
-                  className="hidden"
-                />
-              </label>
+              <div className="flex items-center gap-2">
+                {/* Instant Sample Audio Generator */}
+                <button
+                  type="button"
+                  onClick={handleLoadSampleAudio}
+                  title="Buat sampel audio demo tanpa butuh mikrofon fisik"
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-cyan-950/60 hover:bg-cyan-900/60 text-cyan-300 border border-cyan-800/60 text-xs font-semibold transition-colors"
+                >
+                  <Volume2 className="w-3.5 h-3.5 text-cyan-400" />
+                  <span>Muat Audio Demo</span>
+                </button>
+
+                {/* Upload ElevenLabs file button */}
+                <label className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 text-xs cursor-pointer transition-colors">
+                  <Upload className="w-3.5 h-3.5 text-cyan-400" />
+                  <span>Upload Audio</span>
+                  <input
+                    type="file"
+                    accept="audio/*"
+                    onChange={handleFileUpload}
+                    className="hidden"
+                  />
+                </label>
+              </div>
             </div>
+
+            {/* Mic Warning / Notice Banner if no mic found */}
+            {micNotice && (
+              <div className="p-3.5 rounded-xl bg-amber-950/40 border border-amber-800/60 text-xs text-amber-200 flex items-start gap-2.5">
+                <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                <div className="flex-1 space-y-2">
+                  <p>{micNotice}</p>
+                  <button
+                    type="button"
+                    onClick={handleLoadSampleAudio}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-200 border border-cyan-500/40 rounded-lg text-xs font-semibold transition-colors"
+                  >
+                    <Volume2 className="w-3.5 h-3.5" />
+                    <span>Muat Audio Demo {activeVoice.toUpperCase()}</span>
+                  </button>
+                </div>
+              </div>
+            )}
 
             {/* Audio Recorder from Mic */}
             <div className="p-3.5 rounded-xl bg-slate-950/80 border border-slate-800/80 flex items-center justify-between gap-3">
@@ -426,7 +614,7 @@ export const SttAndSlicer: React.FC<SttAndSlicerProps> = ({ activeVoice }) => {
                   <span className="text-[10px] text-slate-400">
                     {isRecordingAudio
                       ? `Durasi: ${recordingDuration} detik`
-                      : 'Bisa membaca naskah atau bisikan untuk sampel.'}
+                      : 'Gunakan mikrofon atau klik "Muat Audio Demo" di atas jika tanpa mic.'}
                   </span>
                 </div>
               </div>

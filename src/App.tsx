@@ -51,6 +51,7 @@ export default function App() {
           <LyricPlayer
             activeVoice={activeVoice}
             setActiveVoice={setActiveVoice}
+            availableVoices={availableVoices}
           />
         )}
 

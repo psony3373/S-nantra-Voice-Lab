@@ -238,6 +238,177 @@ export function selectBestSystemVoice(profile: VoiceProfile, availableVoices: Sp
   return femaleVoice || pool[pool.length - 1];
 }
 
+// Active procedural nodes to allow cancellation
+let activeProceduralSources: { stop: () => void }[] = [];
+let activeProceduralTimeout: any = null;
+
+export function stopProceduralWhisperVoice() {
+  if (activeProceduralTimeout) {
+    clearTimeout(activeProceduralTimeout);
+    activeProceduralTimeout = null;
+  }
+  activeProceduralSources.forEach((s) => {
+    try {
+      s.stop();
+    } catch {}
+  });
+  activeProceduralSources = [];
+}
+
+// Procedural Web Audio Whisper & Vocal Synthesizer (100% Offline & works without OS TTS engines)
+export function playProceduralWhisperVoice(
+  text: string,
+  profile: VoiceProfile,
+  params: {
+    pitch: number;
+    rate: number;
+    whisperDeVoice: number;
+    breathiness: number;
+    airBoostDb: number;
+    stereoWidth: number;
+  },
+  onEnd?: () => void
+): () => void {
+  stopProceduralWhisperVoice();
+  const ctx = getAudioContext();
+  setupVocalDspChain(profile, params);
+  startAmbientWhisperBed(params.breathiness, profile);
+
+  // Parse into words / syllables
+  const words = text
+    .replace(/[^\w\s\u00C0-\u024F]/gi, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length > 0);
+
+  if (words.length === 0) {
+    stopAmbientWhisperBed();
+    onEnd?.();
+    return () => {};
+  }
+
+  const basePitch = profile.gender === 'male' ? 105 : 215;
+  const pitchFreq = basePitch * params.pitch;
+  let scheduleTime = ctx.currentTime + 0.05;
+
+  words.forEach((word, idx) => {
+    const vowelMatch = word.match(/[aiueo]/i);
+    const vowel = vowelMatch ? vowelMatch[0].toLowerCase() : 'a';
+
+    // Vowel formant target frequencies (F1 and F2)
+    let f1 = 600;
+    let f2 = 1400;
+    if (vowel === 'i') {
+      f1 = 300;
+      f2 = 2300;
+    } else if (vowel === 'u') {
+      f1 = 350;
+      f2 = 900;
+    } else if (vowel === 'e') {
+      f1 = 500;
+      f2 = 1800;
+    } else if (vowel === 'o') {
+      f1 = 500;
+      f2 = 1000;
+    } else {
+      f1 = 800;
+      f2 = 1300;
+    }
+
+    if (profile.gender === 'male') {
+      f1 *= 0.85;
+      f2 *= 0.88;
+    } else {
+      f1 *= 1.12;
+      f2 *= 1.15;
+    }
+
+    const dur = Math.max(0.18, Math.min(0.55, word.length * 0.075 * (1 / params.rate)));
+
+    // 1. Whispered breath noise source
+    const noiseBuf = createBreathNoiseBuffer(ctx, dur + 0.15);
+    const noiseSource = ctx.createBufferSource();
+    noiseSource.buffer = noiseBuf;
+
+    const noiseFilter1 = ctx.createBiquadFilter();
+    noiseFilter1.type = 'bandpass';
+    noiseFilter1.frequency.setValueAtTime(f1, scheduleTime);
+    noiseFilter1.Q.setValueAtTime(2.8, scheduleTime);
+
+    const noiseFilter2 = ctx.createBiquadFilter();
+    noiseFilter2.type = 'bandpass';
+    noiseFilter2.frequency.setValueAtTime(f2, scheduleTime);
+    noiseFilter2.Q.setValueAtTime(3.5, scheduleTime);
+
+    const noiseGain = ctx.createGain();
+    const peakWhisperGain = Math.max(0.04, (params.breathiness / 100) * 0.32 + (params.whisperDeVoice / 100) * 0.22);
+    noiseGain.gain.setValueAtTime(0.001, scheduleTime);
+    noiseGain.gain.exponentialRampToValueAtTime(peakWhisperGain, scheduleTime + 0.04);
+    noiseGain.gain.exponentialRampToValueAtTime(0.001, scheduleTime + dur);
+
+    noiseSource.connect(noiseFilter1);
+    noiseSource.connect(noiseFilter2);
+    noiseFilter1.connect(noiseGain);
+    noiseFilter2.connect(noiseGain);
+
+    // 2. Soft harmonic undertone (reduced as whisperDeVoice increases)
+    const voiceAmt = Math.max(0, 1 - params.whisperDeVoice / 100);
+    const osc = ctx.createOscillator();
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(pitchFreq, scheduleTime);
+    osc.frequency.exponentialRampToValueAtTime(
+      pitchFreq * (1 + ((idx % 2 === 0 ? 1 : -1) * 0.03)),
+      scheduleTime + dur
+    );
+
+    const oscGain = ctx.createGain();
+    const oscPeak = voiceAmt * (profile.gender === 'male' ? 0.07 : 0.045);
+    oscGain.gain.setValueAtTime(0.0001, scheduleTime);
+    if (oscPeak > 0.001) {
+      oscGain.gain.exponentialRampToValueAtTime(oscPeak, scheduleTime + 0.04);
+      oscGain.gain.exponentialRampToValueAtTime(0.0001, scheduleTime + dur);
+    }
+
+    osc.connect(noiseFilter1);
+    osc.connect(oscGain);
+
+    // Route through master vocal chain
+    if (masterGain) {
+      noiseGain.connect(masterGain);
+      oscGain.connect(masterGain);
+    } else {
+      noiseGain.connect(ctx.destination);
+      oscGain.connect(ctx.destination);
+    }
+
+    noiseSource.start(scheduleTime);
+    noiseSource.stop(scheduleTime + dur + 0.05);
+    osc.start(scheduleTime);
+    osc.stop(scheduleTime + dur + 0.05);
+
+    activeProceduralSources.push({
+      stop: () => {
+        try {
+          noiseSource.stop();
+          osc.stop();
+        } catch {}
+      },
+    });
+
+    scheduleTime += dur + (0.06 / params.rate);
+  });
+
+  const totalDuration = Math.max(0.5, scheduleTime - ctx.currentTime);
+  activeProceduralTimeout = setTimeout(() => {
+    stopAmbientWhisperBed();
+    onEnd?.();
+  }, totalDuration * 1000);
+
+  return () => {
+    stopProceduralWhisperVoice();
+    stopAmbientWhisperBed();
+  };
+}
+
 // Speak an individual line with Eryx or Elyra profile & DSP processing
 export function speakLine(
   text: string,
@@ -254,15 +425,6 @@ export function speakLine(
   onStart?: () => void,
   onEnd?: () => void
 ): () => void {
-  const synth = window.speechSynthesis;
-  if (!synth) {
-    console.warn('SpeechSynthesis not supported');
-    onEnd?.();
-    return () => {};
-  }
-
-  synth.cancel();
-
   // Clean tags like [breath], [sigh], [whisper], [pause]
   const cleanText = text
     .replace(/\[breath\]/gi, '')
@@ -272,60 +434,107 @@ export function speakLine(
     .replace(/\.{3,}/g, ', ')
     .trim();
 
-  if (!cleanText) {
-    // If it's pure breath or sigh:
-    if (/\[sigh\]/i.test(text)) {
-      playBreathEffect('sigh', params.breathiness / 100);
-    } else {
-      playBreathEffect('breath', params.breathiness / 100);
-    }
-    setTimeout(() => onEnd?.(), 1000);
-    return () => {};
-  }
-
-  // Check if there are cues
+  // Check if there are breath or sigh cues
   if (/\[breath\]/i.test(text)) {
     playBreathEffect('breath', (params.breathiness / 100) * 0.7);
   } else if (/\[sigh\]/i.test(text)) {
     playBreathEffect('sigh', (params.breathiness / 100) * 0.7);
   }
 
-  // Setup Web Audio graph
+  if (!cleanText) {
+    setTimeout(() => onEnd?.(), 800);
+    return () => {};
+  }
+
+  const synth = typeof window !== 'undefined' ? window.speechSynthesis : null;
+
+  // Fallback immediately if SpeechSynthesis API is completely absent
+  if (!synth) {
+    onStart?.();
+    return playProceduralWhisperVoice(cleanText, profile, params, onEnd);
+  }
+
+  // Gracefully stop any active utterance before starting a new one
+  try {
+    synth.cancel();
+  } catch {}
+
   setupVocalDspChain(profile, params);
   startAmbientWhisperBed(params.breathiness, profile);
 
-  const utterance = new SpeechSynthesisUtterance(cleanText);
-  if (selectedVoice) {
-    utterance.voice = selectedVoice;
+  let isCancelled = false;
+  let proceduralStopper: (() => void) | null = null;
+
+  try {
+    const utterance = new SpeechSynthesisUtterance(cleanText);
+
+    // Auto-resolve voice if not provided
+    let voiceToUse = selectedVoice;
+    if (!voiceToUse && synth.getVoices) {
+      const allVoices = synth.getVoices();
+      voiceToUse = selectBestSystemVoice(profile, allVoices);
+    }
+
+    if (voiceToUse) {
+      utterance.voice = voiceToUse;
+      utterance.lang = voiceToUse.lang || 'id-ID';
+    } else {
+      utterance.lang = 'id-ID';
+    }
+
+    // Pitch calculation: Eryx lower, Elyra higher
+    const deVoiceDamp = 1 - (params.whisperDeVoice / 100) * 0.15;
+    utterance.pitch = Math.max(0.5, Math.min(2.0, params.pitch * deVoiceDamp));
+    utterance.rate = Math.max(0.5, Math.min(1.6, params.rate));
+
+    utterance.onstart = () => {
+      if (!isCancelled) {
+        onStart?.();
+      }
+    };
+
+    utterance.onend = () => {
+      stopAmbientWhisperBed();
+      if (!isCancelled) {
+        onEnd?.();
+      }
+    };
+
+    utterance.onerror = (e: any) => {
+      const errCode = e?.error;
+      // 'canceled' and 'interrupted' are expected when user stops or switches lines
+      if (errCode === 'canceled' || errCode === 'interrupted' || isCancelled) {
+        stopAmbientWhisperBed();
+        onEnd?.();
+        return;
+      }
+
+      // If speech synthesis encountered an environment or audio device issue,
+      // seamlessly fallback to procedural Web Audio speech synthesizer:
+      console.warn(`SpeechSynthesis notice (${errCode || 'unsupported'}), engaging Procedural DSP engine.`);
+      stopAmbientWhisperBed();
+      if (!isCancelled) {
+        proceduralStopper = playProceduralWhisperVoice(cleanText, profile, params, onEnd);
+      }
+    };
+
+    synth.speak(utterance);
+  } catch (err) {
+    console.warn('SpeechSynthesis invocation fallback:', err);
+    proceduralStopper = playProceduralWhisperVoice(cleanText, profile, params, onEnd);
   }
 
-  // Pitch calculation: Eryx is lower (0.7 - 0.85), Elyra is higher (1.1 - 1.3)
-  // Whisper de-voicing also lowers pitch slightly to reduce vocal cord vibration
-  const deVoiceDamp = 1 - (params.whisperDeVoice / 100) * 0.15;
-  utterance.pitch = Math.max(0.5, Math.min(2.0, params.pitch * deVoiceDamp));
-
-  // Speaking rate
-  utterance.rate = Math.max(0.5, Math.min(1.6, params.rate));
-
-  utterance.onstart = () => {
-    onStart?.();
-  };
-
-  utterance.onend = () => {
-    stopAmbientWhisperBed();
-    onEnd?.();
-  };
-
-  utterance.onerror = (e) => {
-    console.error('TTS speech error', e);
-    stopAmbientWhisperBed();
-    onEnd?.();
-  };
-
-  synth.speak(utterance);
-
   return () => {
-    synth.cancel();
+    isCancelled = true;
+    if (synth) {
+      try {
+        synth.cancel();
+      } catch {}
+    }
     stopAmbientWhisperBed();
+    if (proceduralStopper) {
+      proceduralStopper();
+    }
+    stopProceduralWhisperVoice();
   };
 }

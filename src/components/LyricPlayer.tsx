@@ -14,19 +14,22 @@ import {
 } from 'lucide-react';
 import { VoiceId, LyricLine } from '../types';
 import { VOICE_PROFILES, SAMPLE_LYRICS } from '../data/voices';
-import { speakLine, getAudioContext } from '../utils/audioDsp';
+import { speakLine, getAudioContext, selectBestSystemVoice } from '../utils/audioDsp';
 import { AudioVisualizer } from './AudioVisualizer';
 
 interface LyricPlayerProps {
   activeVoice: VoiceId;
   setActiveVoice: (id: VoiceId) => void;
+  availableVoices?: SpeechSynthesisVoice[];
 }
 
 export const LyricPlayer: React.FC<LyricPlayerProps> = ({
   activeVoice,
   setActiveVoice,
+  availableVoices = [],
 }) => {
   const profile = VOICE_PROFILES[activeVoice];
+  const matchedVoice = selectBestSystemVoice(profile, availableVoices);
 
   // Presets & lyrics
   const [selectedPresetIndex, setSelectedPresetIndex] = useState<number>(0);
@@ -146,7 +149,7 @@ export const LyricPlayer: React.FC<LyricPlayerProps> = ({
           airBoostDb: profile.airBoostDb,
           stereoWidth: profile.stereoWidth,
         },
-        null,
+        matchedVoice,
         undefined,
         () => {
           // Pause between lines according to BPM and breath tags
@@ -168,7 +171,9 @@ export const LyricPlayer: React.FC<LyricPlayerProps> = ({
       stopLyricRef.current = null;
     }
     if (window.speechSynthesis) {
-      window.speechSynthesis.cancel();
+      try {
+        window.speechSynthesis.cancel();
+      } catch {}
     }
     setIsPlaying(false);
     setActiveLineIndex(-1);
